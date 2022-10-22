@@ -172,7 +172,23 @@ impl Multiplexer {
             .expect("Failed to activate client");
 
         loop {
-            std::thread::sleep(std::time::Duration::from_secs(30));
+            {
+                let state = self.jack_state.lock().unwrap();
+                println!();
+                for input in state.inputs.iter() {
+                    print!("Input: [");
+                    for item in input.buffer.iter() {
+                        match item {
+                            BufferItem::Samples(..) => {
+                                print!("s")
+                            }
+                            BufferItem::Silence(..) => print!("_"),
+                        }
+                    }
+                    println!("]");
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
 }
