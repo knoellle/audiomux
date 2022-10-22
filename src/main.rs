@@ -1,112 +1,136 @@
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+};
 
-use anyhow::{anyhow, Ok};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use ringbuf::{Consumer, HeapRb, Producer};
+use anyhow::Ok;
+use jack::{AudioIn, AudioOut, Client, Port};
 
+enum BufferItem {
+    Samples(Vec<Vec<f32>>),
+}
+
+#[derive(Default)]
 struct Input {
-    consumer: Consumer<f32, Arc<HeapRb<f32>>>,
+    ports: Vec<Port<AudioIn>>,
+    buffer: VecDeque<BufferItem>,
 }
 
 impl Input {
-    fn new(input_device: &cpal::Device) -> (Self, cpal::Stream) {
-        let buffer = HeapRb::new(4096);
-        let (mut producer, mut consumer) = buffer.split();
-
-        let input_handler = move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            if data.iter().all(|f| f.abs() < 0.01) {
-                return;
-            }
-            println!("len: {}", data.len());
-            println!("sum: {}", data.iter().sum::<f32>());
-            for &sample in data {
-                producer.push(sample);
-            }
-        };
-        let config = input_device.default_input_config().unwrap().into();
-        let stream = input_device
-            .build_input_stream(&config, input_handler, err_fn)
-            .unwrap();
-        (Self { consumer }, stream)
+    fn new(client: &Client, prefix: &str, channel_count: usize) -> Self {
+        let ports = (0..channel_count)
+            .map(|index| {
+                client
+                    .register_port(
+                        format!("{prefix}.{index}").as_str(),
+                        jack::AudioIn::default(),
+                    )
+                    .expect("Failed to register port")
+            })
+            .collect();
+        Self {
+            ports,
+            buffer: VecDeque::new(),
+        }
     }
+}
+
+#[derive(Default)]
+struct JackState {
+    inputs: Vec<Input>,
+    output: Vec<Port<AudioOut>>,
 }
 
 struct Multiplexer {
-    host: cpal::Host,
-    inputs: Arc<Mutex<Vec<Input>>>,
-    input_streams: Vec<cpal::Stream>,
+    jack_state: Arc<Mutex<JackState>>,
 }
 
+
 impl Multiplexer {
-    fn new(input_count: usize) -> Self {
-        let host = cpal::host_from_id(
-            cpal::available_hosts()
-                .into_iter()
-                .find(|id| *id == cpal::HostId::Jack)
-                .expect("No jack server found"),
-        )
-        .expect("Found but failed to talk to jack server");
+    fn new() -> Self {
+        let jack_state = Arc::new(Mutex::new(JackState::default()));
 
-        let input_device = host
-            .default_input_device()
-            .expect("Failed to find input device");
-        let mut inputs = Vec::new();
-        let mut input_streams = Vec::new();
-
-        for _index in 0..input_count {
-            let (input, stream) = Input::new(&input_device);
-            inputs.push(input);
-            input_streams.push(stream);
-        }
-        let inputs = Arc::new(Mutex::new(inputs));
-        Self {
-            host,
-            inputs,
-            input_streams,
-        }
+        Multiplexer { jack_state }
     }
 
     fn run(&self) -> anyhow::Result<()> {
-        for stream in &self.input_streams {
-            stream.play()?;
-        }
-        let inputs = self.inputs.clone();
-        let handle_output = move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-            let inputs = &mut inputs.lock().unwrap();
-            let best_candidate = inputs.iter_mut().find(|input| !input.consumer.is_empty());
-            let consumer = match best_candidate {
-                Some(input) => &mut input.consumer,
-                None => {
-                    data.fill(0.0);
-                    return;
+        let (client, _status) =
+            jack::Client::new("Audio Multiplexer", jack::ClientOptions::NO_START_SERVER)
+                .expect("Failed to create jack client");
+
+        let output = client
+            .register_port("0", jack::AudioOut::default())
+            .expect("Failed to register port");
+
+        let mut state = self.jack_state.lock().unwrap();
+        state.output.push(output);
+        state.inputs.push(Input::new(&client, "1", 1));
+
+        drop(state);
+
+        let jack_state = self.jack_state.clone();
+        let process_callback =
+            move |_client: &jack::Client, scope: &jack::ProcessScope| -> jack::Control {
+                let mut state = jack_state.lock().unwrap();
+
+                for input in state.inputs.iter_mut() {
+                    let silent = input
+                        .ports
+                        .iter()
+                        .all(|port| port.as_slice(scope).iter().all(|f| f.abs() < 0.01));
+                    if silent {
+                        continue;
+                    }
+                    let samples = input
+                        .ports
+                        .iter()
+                        .map(|port| Vec::from(port.as_slice(scope)))
+                        .collect();
+
+                    input.buffer.push_back(BufferItem::Samples(samples));
                 }
+
+                let buffer_item = match state
+                    .inputs
+                    .iter_mut()
+                    .find(|input| !input.buffer.is_empty())
+                {
+                    Some(input) => input.buffer.pop_front().unwrap(),
+                    None => {
+                        state
+                            .output
+                            .iter_mut()
+                            .for_each(|port| port.as_mut_slice(scope).fill(0.0));
+                        return jack::Control::Continue;
+                    }
+                };
+                match buffer_item {
+                    BufferItem::Samples(samples) => {
+                        state
+                            .output
+                            .iter_mut()
+                            .zip(samples.iter())
+                            .for_each(|(port, samples)| {
+                                port.as_mut_slice(scope).clone_from_slice(samples)
+                            });
+                    }
+                }
+                jack::Control::Continue
             };
-            for sample in data {
-                *sample = consumer.pop().unwrap_or(0.0);
-            }
-        };
-        let output_device = self
-            .host
-            .default_output_device()
-            .expect("Failed to find output device");
-        let config = output_device.default_output_config()?.into();
+        let process = jack::ClosureProcessHandler::new(process_callback);
+        let _active_client = client
+            .activate_async((), process)
+            .expect("Failed to activate client");
 
-        let output_stream = output_device.build_output_stream(&config, handle_output, err_fn)?;
-        output_stream.play()?;
-
-        std::thread::sleep(std::time::Duration::from_secs(300));
-
-        Ok(())
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(30));
+        }
     }
 }
 
 fn main() -> anyhow::Result<()> {
-    let multiplexer = Multiplexer::new(2);
-    multiplexer.run();
+    let multiplexer = Multiplexer::new();
+    multiplexer.run().unwrap();
 
     Ok(())
-}
-
-fn err_fn(err: cpal::StreamError) {
-    eprintln!("an error occurred on stream: {}", err);
 }
