@@ -8,6 +8,7 @@ use jack::{AudioIn, AudioOut, Client, Port};
 
 enum BufferItem {
     Samples(Vec<Vec<f32>>),
+    Silence(usize),
 }
 
 #[derive(Default)]
@@ -33,6 +34,16 @@ impl Input {
             buffer: VecDeque::new(),
         }
     }
+
+    fn buffered_samples(&self) -> usize {
+        self.buffer
+            .iter()
+            .map(|item| match item {
+                BufferItem::Samples(samples) => samples[0].len(),
+                BufferItem::Silence(_) => 0,
+            })
+            .sum()
+    }
 }
 
 #[derive(Default)]
@@ -44,7 +55,6 @@ struct JackState {
 struct Multiplexer {
     jack_state: Arc<Mutex<JackState>>,
 }
-
 
 impl Multiplexer {
     fn new() -> Self {
@@ -62,7 +72,7 @@ impl Multiplexer {
             .register_port("0", jack::AudioOut::default())
             .expect("Failed to register port");
         let output2 = client
-            .register_port("0", jack::AudioOut::default())
+            .register_port("1", jack::AudioOut::default())
             .expect("Failed to register port");
 
         let mut state = self.jack_state.lock().unwrap();
@@ -78,13 +88,33 @@ impl Multiplexer {
             move |_client: &jack::Client, scope: &jack::ProcessScope| -> jack::Control {
                 let mut state = jack_state.lock().unwrap();
 
+                let frame_size = state.inputs[0].ports[0].as_slice(scope).len();
+
                 for input in state.inputs.iter_mut() {
                     let silent = input
                         .ports
                         .iter()
                         .all(|port| port.as_slice(scope).iter().all(|f| f.abs() < 0.01));
                     if silent {
+                        match input.buffer.back_mut() {
+                            // Last item is silence, increase duration
+                            Some(BufferItem::Silence(samples_remaining)) => {
+                                *samples_remaining = 4800.min(*samples_remaining + frame_size)
+                            }
+                            // Buffer empty? Keep it that way to prevent latency when something
+                            // does come in
+                            None => {}
+                            // Samples are buffered, store silence to keep somewhat natural pacing
+                            _ => input.buffer.push_back(BufferItem::Silence(frame_size)),
+                        }
+
                         continue;
+                    }
+                    // Skip silence if new samples come in
+                    if input.buffer.len() == 1
+                        && matches!(input.buffer.back(), Some(BufferItem::Silence(_)))
+                    {
+                        input.buffer.pop_front();
                     }
                     let samples = input
                         .ports
@@ -95,12 +125,12 @@ impl Multiplexer {
                     input.buffer.push_back(BufferItem::Samples(samples));
                 }
 
-                let buffer_item = match state
+                let input = match state
                     .inputs
                     .iter_mut()
-                    .find(|input| !input.buffer.is_empty())
+                    .find(|input| input.buffered_samples() > 0)
                 {
-                    Some(input) => input.buffer.pop_front().unwrap(),
+                    Some(input) => input,
                     None => {
                         state
                             .output
@@ -109,6 +139,7 @@ impl Multiplexer {
                         return jack::Control::Continue;
                     }
                 };
+                let buffer_item = input.buffer.pop_front().unwrap();
                 match buffer_item {
                     BufferItem::Samples(samples) => {
                         state
@@ -118,6 +149,19 @@ impl Multiplexer {
                             .for_each(|(port, samples)| {
                                 port.as_mut_slice(scope).clone_from_slice(samples)
                             });
+                    }
+                    BufferItem::Silence(sample_count) => {
+                        let silence_remaining =
+                            sample_count as isize - input.ports[0].as_slice(scope).len() as isize;
+                        if silence_remaining > 0 {
+                            input
+                                .buffer
+                                .push_front(BufferItem::Silence(silence_remaining as usize));
+                        }
+                        state
+                            .output
+                            .iter_mut()
+                            .for_each(|port| port.as_mut_slice(scope).fill(0.0));
                     }
                 }
                 jack::Control::Continue
