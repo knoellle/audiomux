@@ -61,10 +61,15 @@ impl Multiplexer {
         let output = client
             .register_port("0", jack::AudioOut::default())
             .expect("Failed to register port");
+        let output2 = client
+            .register_port("0", jack::AudioOut::default())
+            .expect("Failed to register port");
 
         let mut state = self.jack_state.lock().unwrap();
         state.output.push(output);
-        state.inputs.push(Input::new(&client, "1", 1));
+        state.output.push(output2);
+        state.inputs.push(Input::new(&client, "1", 2));
+        state.inputs.push(Input::new(&client, "2", 2));
 
         drop(state);
 
