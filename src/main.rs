@@ -1,5 +1,6 @@
 use std::{
     collections::VecDeque,
+    process::Command,
     sync::{Arc, Mutex},
 };
 
@@ -11,10 +12,19 @@ enum BufferItem {
     Silence(usize),
 }
 
+struct AutoPausing {
+    source_paused: bool,
+    pause_threshold: usize,
+    resume_threshold: usize,
+    pause_command: String,
+    resume_command: String,
+}
+
 #[derive(Default)]
 struct Input {
     ports: Vec<Port<AudioIn>>,
     buffer: VecDeque<BufferItem>,
+    pausing: Option<AutoPausing>,
 }
 
 impl Input {
@@ -32,6 +42,7 @@ impl Input {
         Self {
             ports,
             buffer: VecDeque::new(),
+            pausing: None,
         }
     }
 
@@ -87,7 +98,15 @@ impl Multiplexer {
         state.output.push(output);
         state.output.push(output2);
         state.inputs.push(Input::new(&client, "1", 2));
-        state.inputs.push(Input::new(&client, "2", 2));
+        let mut second_input = Input::new(&client, "2", 2);
+        second_input.pausing = Some(AutoPausing {
+            source_paused: false,
+            pause_threshold: 48000,
+            resume_threshold: 4800,
+            pause_command: "playerctl pause".to_string(),
+            resume_command: "playerctl play".to_string(),
+        });
+        state.inputs.push(second_input);
 
         drop(state);
 
@@ -182,9 +201,9 @@ impl Multiplexer {
 
         loop {
             {
-                let state = self.jack_state.lock().unwrap();
+                let mut state = self.jack_state.lock().unwrap();
                 println!();
-                for input in state.inputs.iter() {
+                for input in state.inputs.iter_mut() {
                     print!("Input: [");
                     for item in input.buffer.iter() {
                         match item {
@@ -195,6 +214,26 @@ impl Multiplexer {
                         }
                     }
                     println!("]");
+                    println!("{}", input.urgency());
+                    let buffered_samples = input.buffered_samples();
+                    if let Some(pausing) = input.pausing.as_mut() {
+                        if pausing.source_paused && buffered_samples < pausing.resume_threshold {
+                            Command::new("bash")
+                                .arg("-c")
+                                .arg(&pausing.resume_command)
+                                .spawn()
+                                .unwrap();
+                            pausing.source_paused = false;
+                        }
+                        if !pausing.source_paused && buffered_samples > pausing.pause_threshold {
+                            Command::new("bash")
+                                .arg("-c")
+                                .arg(&pausing.pause_command)
+                                .spawn()
+                                .unwrap();
+                            pausing.source_paused = true;
+                        }
+                    }
                 }
             }
             std::thread::sleep(std::time::Duration::from_millis(1));
