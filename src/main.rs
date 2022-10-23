@@ -44,6 +44,14 @@ impl Input {
             })
             .sum()
     }
+
+    fn urgency(&self) -> f32 {
+        let silence_penalty = match self.buffer.front() {
+            Some(BufferItem::Silence(count)) => *count as f32,
+            _ => 0.0,
+        };
+        (self.buffered_samples() as f32).sqrt() - silence_penalty
+    }
 }
 
 #[derive(Default)]
@@ -125,8 +133,9 @@ impl Multiplexer {
                     input.buffer.push_back(BufferItem::Samples(samples));
                 }
 
-                let input = match state
-                    .inputs
+                let mut sorted_inputs: Vec<_> = state.inputs.iter_mut().collect();
+                sorted_inputs.sort_by(|a, b| b.urgency().total_cmp(&a.urgency()));
+                let input = match sorted_inputs
                     .iter_mut()
                     .find(|input| input.buffered_samples() > 0)
                 {
