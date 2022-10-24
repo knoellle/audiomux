@@ -1,11 +1,17 @@
 use std::{
     collections::VecDeque,
+    os::raw::c_void,
     process::Command,
     sync::{Arc, Mutex},
 };
 
 use anyhow::Ok;
-use jack::{AudioIn, AudioOut, Client, Port};
+use interleave_all::interleave_all;
+use jack::{AudioIn, AudioOut, Client, Control, Port, ProcessScope};
+use sound_touch::SoundTouch;
+use soundtouch_sys::soundtouch_SoundTouch;
+mod interleave_all;
+mod sound_touch;
 
 enum BufferItem {
     Samples(Vec<Vec<f32>>),
@@ -67,6 +73,7 @@ impl Input {
 
 #[derive(Default)]
 struct JackState {
+    soundtouch: SoundTouch,
     inputs: Vec<Input>,
     output: Vec<Port<AudioOut>>,
 }
@@ -84,21 +91,24 @@ impl Multiplexer {
 
     fn run(&self) -> anyhow::Result<()> {
         let (client, _status) =
-            jack::Client::new("Audio Multiplexer", jack::ClientOptions::NO_START_SERVER)
+            Client::new("Audio Multiplexer", jack::ClientOptions::NO_START_SERVER)
                 .expect("Failed to create jack client");
 
-        let output = client
-            .register_port("0", jack::AudioOut::default())
-            .expect("Failed to register port");
-        let output2 = client
-            .register_port("1", jack::AudioOut::default())
-            .expect("Failed to register port");
-
         let mut state = self.jack_state.lock().unwrap();
-        state.output.push(output);
-        state.output.push(output2);
-        state.inputs.push(Input::new(&client, "1", 2));
-        let mut second_input = Input::new(&client, "2", 2);
+
+        let channel_count = 2;
+        state.soundtouch.set_channels(channel_count as u32);
+        state
+            .soundtouch
+            .set_sample_rate(client.sample_rate() as u32);
+
+        state.output.extend((0..channel_count).map(|index| {
+            client
+                .register_port(format!("{index}").as_str(), jack::AudioOut::default())
+                .expect("Failed to register port")
+        }));
+        state.inputs.push(Input::new(&client, "1", channel_count));
+        let mut second_input = Input::new(&client, "2", channel_count);
         second_input.pausing = Some(AutoPausing {
             source_paused: false,
             pause_threshold: 48000,
@@ -112,7 +122,7 @@ impl Multiplexer {
 
         let jack_state = self.jack_state.clone();
         let process_callback =
-            move |_client: &jack::Client, scope: &jack::ProcessScope| -> jack::Control {
+            move |_client: &Client, scope: &ProcessScope| -> Control {
                 let mut state = jack_state.lock().unwrap();
 
                 let frame_size = state.inputs[0].ports[0].as_slice(scope).len();
@@ -152,47 +162,78 @@ impl Multiplexer {
                     input.buffer.push_back(BufferItem::Samples(samples));
                 }
 
-                let mut sorted_inputs: Vec<_> = state.inputs.iter_mut().collect();
-                sorted_inputs.sort_by(|a, b| b.urgency().total_cmp(&a.urgency()));
-                let input = match sorted_inputs
-                    .iter_mut()
-                    .find(|input| input.buffered_samples() > 0)
-                {
-                    Some(input) => input,
-                    None => {
-                        state
-                            .output
-                            .iter_mut()
-                            .for_each(|port| port.as_mut_slice(scope).fill(0.0));
-                        return jack::Control::Continue;
-                    }
-                };
-                let buffer_item = input.buffer.pop_front().unwrap();
-                match buffer_item {
-                    BufferItem::Samples(samples) => {
-                        state
-                            .output
-                            .iter_mut()
-                            .zip(samples.iter())
-                            .for_each(|(port, samples)| {
-                                port.as_mut_slice(scope).clone_from_slice(samples)
-                            });
-                    }
-                    BufferItem::Silence(sample_count) => {
-                        let silence_remaining =
-                            sample_count as isize - input.ports[0].as_slice(scope).len() as isize;
-                        if silence_remaining > 0 {
-                            input
-                                .buffer
-                                .push_front(BufferItem::Silence(silence_remaining as usize));
+                let mut written_samples = 0;
+                while written_samples < frame_size {
+                    let mut sorted_inputs: Vec<_> = state.inputs.iter_mut().collect();
+                    sorted_inputs.sort_by(|a, b| b.urgency().total_cmp(&a.urgency()));
+
+                    let input = match sorted_inputs
+                        .iter_mut()
+                        .find(|input| input.buffered_samples() > 0)
+                    {
+                        Some(input) => input,
+                        None => {
+                            state
+                                .output
+                                .iter_mut()
+                                .for_each(|port| port.as_mut_slice(scope).fill(0.0));
+                            return Control::Continue;
                         }
-                        state
-                            .output
-                            .iter_mut()
-                            .for_each(|port| port.as_mut_slice(scope).fill(0.0));
+                    };
+
+                    let buffer_item = input.buffer.pop_front().unwrap();
+                    match buffer_item {
+                        BufferItem::Samples(samples) => {
+                            let mut mixed_samples: Vec<f32> = interleave_all(samples).collect();
+                            let channels = state.output.len();
+
+                            state
+                                .soundtouch
+                                .put_samples(&mixed_samples, mixed_samples.len());
+
+                            let requested_sample_count = (frame_size - written_samples) * channels;
+                            let num_samples = state
+                                .soundtouch
+                                .receive_samples(&mut mixed_samples, requested_sample_count);
+                            println!("Requested: {}", requested_sample_count);
+                            println!("Mixed: {}", mixed_samples.len());
+                            mixed_samples.truncate(num_samples);
+                            println!("Mixed: {}", mixed_samples.len());
+
+                            let unmixed_samples = (0..channels).map(|index| {
+                                let x = mixed_samples
+                                    .iter()
+                                    .skip(index)
+                                    .step_by(channels)
+                                    .cloned()
+                                    .collect::<Vec<f32>>();
+                                println!("Got: {}", x.len());
+                                x
+                            });
+                            state.output.iter_mut().zip(unmixed_samples).for_each(
+                                |(port, samples)| {
+                                    port.as_mut_slice(scope)[written_samples..]
+                                        .clone_from_slice(&samples)
+                                },
+                            );
+                            written_samples += num_samples;
+                        }
+                        BufferItem::Silence(sample_count) => {
+                            let silence_remaining = sample_count as isize
+                                - input.ports[0].as_slice(scope).len() as isize;
+                            if silence_remaining > 0 {
+                                input
+                                    .buffer
+                                    .push_front(BufferItem::Silence(silence_remaining as usize));
+                            }
+                            state
+                                .output
+                                .iter_mut()
+                                .for_each(|port| port.as_mut_slice(scope).fill(0.0));
+                        }
                     }
                 }
-                jack::Control::Continue
+                Control::Continue
             };
         let process = jack::ClosureProcessHandler::new(process_callback);
         let _active_client = client
@@ -242,8 +283,44 @@ impl Multiplexer {
 }
 
 fn main() -> anyhow::Result<()> {
+    unsafe {
+        let mut soundtouch = soundtouch_SoundTouch::new();
+        soundtouch.setSampleRate(48000);
+        soundtouch.setChannels(1);
+        soundtouch.setTempo(2.0);
+        // soundtouch.setSetting(sound_touch::SETTING_SEQUENCE_MS, 40);
+        // soundtouch.setSetting(sound_touch::SETTING_SEEKWINDOW_MS, 15);
+        // soundtouch.setSetting(sound_touch::SETTING_OVERLAP_MS, 8);
+        let samples: Vec<f32> = (0..48000).map(|index| (index as f32).sin()).collect();
+        soundtouch_sys::soundtouch_SoundTouch_putSamples(
+            &mut soundtouch as *mut _ as *mut c_void,
+            samples.as_ptr(),
+            samples.len() as u32,
+        );
+
+        let mut new_samples: Vec<f32> = vec![0.0; 48000];
+        let count = soundtouch_sys::soundtouch_SoundTouch_receiveSamples(
+            &mut soundtouch as *mut _ as *mut c_void,
+            new_samples.as_mut_ptr(),
+            new_samples.len() as u32,
+        );
+
+        for sample in samples.iter().take(100) {
+            println!("{}", sample);
+        }
+        println!();
+        for sample in new_samples.iter().take(100) {
+            println!("{}", sample);
+        }
+        println!("Count: {}", count);
+        println!(
+            "Waiting: {:?}",
+            soundtouch_sys::soundtouch_numSamples(&soundtouch as *const soundtouch_SoundTouch)
+        );
+    }
+    return Ok(());
+
     let multiplexer = Multiplexer::new();
     multiplexer.run().unwrap();
-
     Ok(())
 }

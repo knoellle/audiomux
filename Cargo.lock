@@ -328,8 +328,6 @@ checksum = "43b2853a4d09f215c24cc5489c992ce46052d359b5109343cbafbf26bc62f8a3"
 [[package]]
 name = "soundtouch-sys"
 version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9112246fcc9ec651b9c18df4ce883a2cddc52331f49394bef0622e1eb271bcf7"
 dependencies = [
  "bindgen",
  "pkg-config",
